@@ -2,3 +2,8 @@
 tx
 *.mod
 *.bin
+*.o
+*.swp
+!benchmark
+*.o
+

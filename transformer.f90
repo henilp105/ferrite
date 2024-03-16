@@ -1,57 +1,3 @@
-module precision_module
-  implicit none
-  integer, parameter :: wp = kind(1.0)
-end module precision_module
-
-! structs for reading weights, config information and state 
-module weight_module
-        use precision_module
-        implicit none
-        private wp
-
-        type TransformerWeights
-                real(kind=wp), allocatable :: word_embeddings(:,:)
-                real(kind=wp), allocatable :: position_embeddings(:,:)
-                real(kind=wp), allocatable :: emb_layer_norm_w(:)
-                real(kind=wp), allocatable :: emb_layer_norm_b(:)
-                real(kind=wp), allocatable :: wq(:,:,:)
-                real(kind=wp), allocatable :: bq(:,:)
-                real(kind=wp), allocatable :: wk(:,:,:)
-                real(kind=wp), allocatable :: bk(:,:)
-                real(kind=wp), allocatable :: wv(:,:,:)
-                real(kind=wp), allocatable :: bv(:,:)
-                real(kind=wp), allocatable :: wo(:,:,:)
-                real(kind=wp), allocatable :: bo(:,:)
-                real(kind=wp), allocatable :: sa_layer_norm_w(:,:)
-                real(kind=wp), allocatable :: sa_layer_norm_b(:,:)
-                real(kind=wp), allocatable :: w1(:,:,:)
-                real(kind=wp), allocatable :: b1(:,:)
-                real(kind=wp), allocatable :: w2(:,:,:)
-                real(kind=wp), allocatable :: b2(:,:)
-                real(kind=wp), allocatable :: out_layer_norm_w(:,:)
-                real(kind=wp), allocatable :: out_layer_norm_b(:,:)
-                real(kind=wp), allocatable :: linear(:,:)
-
-        end type TransformerWeights
-
-        type Config
-                INTEGER :: emb_dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len
-        end type Config
-
-        type RunState
-
-                real(kind=wp), allocatable :: att(:,:)
-                real(kind=wp), allocatable :: key_cache(:,:,:)
-                real(kind=wp), allocatable :: value_cache(:,:,:)
-                real(kind=wp) :: times(5)
-
-        end type RunState
-
-end module weight_module
-
-
-
-
 module arg_parse
         implicit none
 
@@ -60,9 +6,10 @@ module arg_parse
                 character(:), allocatable :: model_file
                 character(:), allocatable :: prompt
                 character(:), allocatable :: tokenizer
+                character(:), allocatable :: filename
                 logical :: verbose
                 integer :: n
-                logical :: single_line, quiet
+                logical :: single_line, quiet, time
         end type args
 
         contains
@@ -83,6 +30,8 @@ module arg_parse
                         arg_values%tokenizer = "tokenizer.bin"
                         arg_values%single_line = .false.
                         arg_values%quiet = .false.
+                        arg_values%filename = ""
+                        arg_values%time = .false.
 
                         num_args = command_argument_count()
 
@@ -115,6 +64,12 @@ module arg_parse
                                                 call get_command_argument(i+1, arg)
                                                 read(arg,*) arg_values%n
                                                 i = i + 2
+                                                case ('-f', '--filename')
+                                                ! text file with a prompt on each line
+                                                call get_command_argument(i+1, arg)
+                                                arg_values%filename = trim(arg)
+
+                                                i = i + 2
                                                 case ('-v', '--verbose')
                                                 ! print additional information
                                                 arg_values%verbose = .true.
@@ -126,6 +81,10 @@ module arg_parse
                                                 case ('-q', '--quiet')
                                                         ! don't print embedding
                                                 arg_values%quiet = .true.
+                                                i = i + 1
+                                                case ('--time')
+                                                        ! display timings
+                                                arg_values%time = .true.
                                                 i = i + 1
                                                 case default
                                                 print *, 'Unrecognized option:', trim(arg)
@@ -146,6 +105,7 @@ program transformer
         use precision_module
         use weight_module
         use arg_parse
+        use read_ggml, only: load_ggml
         implicit none
 
         type(TransformerWeights) :: weights
@@ -156,17 +116,21 @@ program transformer
 
         type (args) :: arg_values
         character(:), allocatable :: prompt
-        logical :: verbose
+        logical :: verbose, time
 
         real(kind=wp) :: score
-        integer :: tok_len, max_len, n, l
+        integer :: tok_len, max_len, n, p, l
         !integer :: vocab_size = 32000
         character(:), allocatable :: tmpstr
         character(:), dimension(:), allocatable :: vocab
         real(kind=wp),allocatable :: y(:), scores(:)
         integer, allocatable :: prompt_tokens(:)
         integer, allocatable :: vocab_len(:)
-
+        integer, parameter :: max_prompt_len = 1024
+        character(:), dimension(:), allocatable :: prompts
+        character(len=max_prompt_len) :: temp_prompt
+        integer :: tfid, ierr, num_lines
+        real(kind=wp) :: t_start, t_end
 
         character(:), dimension(:), allocatable :: simple_tokens
         !integer, allocatable :: prompt_tokens
@@ -174,224 +138,82 @@ program transformer
 
         call parse_args(arg_values)
 
-        if (arg_values%prompt .eq. "") then
+        if (arg_values%prompt == "" .and. arg_values%filename == "") then
+                !print *, arg_values%filename
                 print *, "prompt required"
                 stop
         end if
 
         verbose = arg_values%verbose
+        time = arg_values%time
 
         msize = 0
-        ! open the model file 
-        open(UNIT=5, FILE=arg_values%model_file, FORM="UNFORMATTED",&
-                &ACCESS="STREAM", STATUS="OLD", POSITION="REWIND", ACTION="READ")
-                ! config
-                read(5) emb_dim, hidden_dim, n_layers, n_heads, itmp, vocab_size, seq_len
-
-                cfg%emb_dim = emb_dim
-                cfg%hidden_dim = hidden_dim
-                cfg%n_layers = n_layers
-                cfg%n_heads = n_heads
-                cfg%vocab_size = vocab_size
-                cfg%seq_len = seq_len
-
-                if (verbose) then
-                        print *, "Embedding dimension: ", emb_dim
-                        print *, "Hidden dimension: ", hidden_dim
-                        print *, "Layers: ", n_layers
-                        print *, "Heads: ", n_heads
-                        print *, "Vocabulary Size: ", vocab_size
-                        print *, "Sequence Length: ", seq_len
-
-                end if
-
-                ! all the weights
-                !real(kind=wp), allocatable :: word_embeddings(:,:)
-                allocate(weights%word_embeddings(emb_dim,vocab_size))
-                read(5) weights%word_embeddings
-                msize = msize + size(weights%word_embeddings)
-                                
-                !real(kind=wp), allocatable :: position_embeddings(:,:)
-                allocate(weights%position_embeddings(emb_dim,seq_len))
-                read(5) weights%position_embeddings
-                !print *, weights%position_embeddings(:,3)
-                msize = msize + size(weights%position_embeddings)
-
-                !real(kind=wp), allocatable :: emb_layer_norm_w(:)
-                allocate(weights%emb_layer_norm_w(emb_dim))
-                read(5) weights%emb_layer_norm_w
-                msize = msize + size(weights%emb_layer_norm_w)
-
-                !real(kind=wp), allocatable :: emb_layer_norm_b(:)
-                allocate(weights%emb_layer_norm_b(emb_dim))
-                read(5) weights%emb_layer_norm_b
-                msize = msize + size(weights%emb_layer_norm_b)
-
-                !real(kind=wp), allocatable :: wq(:,:,:)
-                allocate(weights%wq(emb_dim,emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%wq(:,:,l)
-                end do
-                msize = msize + size(weights%wq)
-                
-                !real(kind=wp), allocatable :: bq(:,:)
-                allocate(weights%bq(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%bq(:,l)
-                end do
-                msize = msize + size(weights%bq)
-               
-                !real(kind=wp), allocatable :: wk(:,:,:)
-                allocate(weights%wk(emb_dim,emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%wk(:,:,l)
-                end do
-                msize = msize + size(weights%wk)
-
-                !real(kind=wp), allocatable :: bk(:,:)
-                allocate(weights%bk(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%bk(:,l)
-                end do
-                msize = msize + size(weights%bk)
-
-                !real(kind=wp), allocatable :: wv(:,:,:)
-                allocate(weights%wv(emb_dim,emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%wv(:,:,l)
-                end do
-                msize = msize + size(weights%wv)
-
-                !real(kind=wp), allocatable :: bv(:,:)
-                allocate(weights%bv(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%bv(:,l)
-                end do
-                msize = msize + size(weights%bv)
-
-                !real(kind=wp), allocatable :: wo(:,:,:)
-                allocate(weights%wo(emb_dim,emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%wo(:,:,l)
-                end do
-                msize = msize + size(weights%wo)
-
-                !real(kind=wp), allocatable :: bo(:,:)
-                allocate(weights%bo(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%bo(:,l)
-                end do
-                msize = msize + size(weights%bo)
-
-                !real(kind=wp), allocatable :: sa_layer_norm_w(:)
-                allocate(weights%sa_layer_norm_w(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%sa_layer_norm_w(:,l)
-                end do
-                msize = msize + size(weights%sa_layer_norm_w)
-
-                !real(kind=wp), allocatable :: sa_layer_norm_b(:)
-                allocate(weights%sa_layer_norm_b(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%sa_layer_norm_b(:,l)
-                end do
-                msize = msize + size(weights%sa_layer_norm_b)
-
-                !real(kind=wp), allocatable :: w1(:,:,:)
-                allocate(weights%w1(emb_dim,hidden_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%w1(:,:,l)
-                end do
-                msize = msize + size(weights%w1)
-
-                !real(kind=wp), allocatable :: b1(:,:,:)
-                allocate(weights%b1(hidden_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%b1(:,l)
-                end do
-                msize = msize + size(weights%b1)
-
-                !real(kind=wp), allocatable :: w2(:,:,:)
-                allocate(weights%w2(hidden_dim,emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%w2(:,:,l)
-                end do
-                msize = msize + size(weights%w2)
-
-                !real(kind=wp), allocatable :: b2(:,:,:)
-                allocate(weights%b2(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%b2(:,l)
-                end do
-                msize = msize + size(weights%b2)
-                
-                !real(kind=wp), allocatable :: out_layer_norm_w(:)
-                allocate(weights%out_layer_norm_w(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%out_layer_norm_w(:,l)
-                end do
-                msize = msize + size(weights%out_layer_norm_w)
-
-                !real(kind=wp), allocatable :: out_layer_norm_b(:)
-                allocate(weights%out_layer_norm_b(emb_dim,n_layers))
-                do l = 1,n_layers
-                read(5) weights%out_layer_norm_b(:,l)
-                end do
-                msize = msize + size(weights%out_layer_norm_b)
         
-                allocate(weights%linear(emb_dim,emb_dim))
-                read(5) weights%linear
-                msize = msize + size(weights%linear)
-
-                if (verbose) then 
-                        print *, "loaded model, size: ", msize
-                end if 
-
-
-        close(5)
-
-
-        open(UNIT=5, FILE=arg_values%tokenizer, FORM="UNFORMATTED",&
-               & ACCESS="STREAM", STATUS="OLD", POSITION="REWIND", ACTION="READ")
-
-                read(5) max_len
-
-                ! in fortran, all strings have to be the same length
-                allocate(character(len=max_len) ::  vocab(vocab_size))
-                allocate(scores(vocab_size))
-                allocate(vocab_len(vocab_size))
-
-
-                do n = 1,vocab_size
-
-
-                read(5) score
-                read(5) tok_len
-                allocate (character(tok_len) :: tmpstr)
-                read(5) tmpstr
-
-                vocab(n) = tmpstr
-                scores(n) = score
-                ! we track the length of each token to preserve trailing whitespace
-                vocab_len(n) = tok_len
-
-                deallocate(tmpstr)
-                end do
-
-        close(5)
+        t_start = time_ms()
+        
+        call load_ggml(arg_values%model_file, weights, cfg, vocab, vocab_len, verbose)
+        emb_dim = cfg%emb_dim
+        hidden_dim = cfg%hidden_dim
+        n_layers = cfg%n_layers
+        n_heads = cfg%n_heads
+        vocab_size = cfg%vocab_size
+        seq_len = cfg%seq_len
+        max_len = maxval(vocab_len)
+        
         
         if (verbose) then
-                write(*,"(A,I0,A)") "Read ", vocab_size, " tokens"
+                !write(*,"(A,I0,A)") "Read ", vocab_size, " tokens"
                 write(*,"(A,A)") "Token 4081 is ", vocab(4081)
         end if
 
-        ! tokenize prompt
-        simple_tokens = simple_tokenize(arg_values%prompt)
 
-        prompt_tokens = sp_tokenize(arg_values%prompt)
+        ! if there is a prompt, read the prompt and make a length 1 list
+        ! if there is a file, read the lines into a list
+        
+        if (arg_values%prompt /= "") then
+                allocate(character(len=max_prompt_len) ::  prompts(1))
+                prompts(1) = arg_values%prompt
+        
+        else if (arg_values%filename /= "") then
+
+                tfid = 5
+                open(unit=tfid,file=arg_values%filename)
+                ierr = 0
+                num_lines = -1
+                do while (ierr == 0)
+                        num_lines = num_lines + 1
+                        read(tfid,*,iostat=ierr) temp_prompt
+                end do
+
+                if (verbose) then
+                        write(*,'(A,I0,A)') "Read ", num_lines, " lines"
+                end if
+
+                allocate(character(len=max_prompt_len) ::  prompts(num_lines))
+
+                rewind(tfid)
+                do p = 1,num_lines
+                read(tfid, '(A)') prompts(p)
+                end do
+        
+        end if
+        
+        t_end = time_ms()
+
+        if (time) then
+                print *, "Load time in seconds: ", (t_end-t_start)/1000
+        end if  
+        
+        ! tokenize prompt
+        !simple_tokens = simple_tokenize(arg_values%prompt)
+
+        t_start = time_ms()
+        do p=1,size(prompts)
+        prompt_tokens = sp_tokenize(trim(prompts(p)))
 
 
         if (verbose) then 
+        simple_tokens = simple_tokenize(trim(prompts(p)))
         do n=1,size(simple_tokens)
                 print *, "simple token: ", simple_tokens(n)
                 print *, "wordpiece tokens: ", encode_word(simple_tokens(n))
@@ -405,7 +227,7 @@ program transformer
         y = dbert(prompt_tokens,weights,cfg)
         
         if (arg_values%quiet) then
-                stop
+                cycle
         end if 
 
         if (arg_values%single_line) then
@@ -415,6 +237,14 @@ program transformer
         else
                 print *, y
         end if
+
+        end do
+        t_end = time_ms()
+
+        if (time) then
+                print *, "Total inference time in seconds: ", (t_end-t_start)/1000
+        end if
+
 
 contains
 
@@ -573,7 +403,7 @@ contains
                         i = i - 1
                         end do  
                         
-                        if ( i .eq. 0) then
+                        if ( i == 0) then
                                 deallocate(tokens)
                                 tokens = ["UNK"]
                                 return 
@@ -626,7 +456,7 @@ contains
 
                 pos = 1
 
-                if (index(punct,ltext(pos:pos)) > 0 .and. pos .le. len_trim(ltext)) then
+                if (index(punct,ltext(pos:pos)) > 0 .and. pos <= len_trim(ltext)) then
                         !print *, index(punct,ltext(pos:pos))
                         next_token = ltext(pos:pos)
                         !if (verbose) then
@@ -637,9 +467,9 @@ contains
                         cycle 
                 end if
                 
-                if (index(alpha,ltext(pos:pos)) > 0 .and. pos .le. len_trim(ltext)) then !next char is alphabet
+                if (index(alpha,ltext(pos:pos)) > 0 .and. pos <= len_trim(ltext)) then !next char is alphabet
                 
-                do while(index(alpha,ltext(pos:pos)) > 0 .and. pos .le. len_trim(ltext))
+                do while(index(alpha,ltext(pos:pos)) > 0 .and. pos <= len_trim(ltext))
                         pos = pos + 1
                 end do
 
@@ -656,8 +486,8 @@ contains
                 ! fortran 2003?
                 tokens = [tokens, next_token]
 
-                else if (index(numbers,ltext(pos:pos)) > 0 .and. pos .le. len_trim(ltext)) then ! next char is number
-                do while(index(numbers,ltext(pos:pos)) > 0 .and. pos .le. len_trim(ltext))
+                else if (index(numbers,ltext(pos:pos)) > 0 .and. pos <= len_trim(ltext)) then ! next char is number
+                do while(index(numbers,ltext(pos:pos)) > 0 .and. pos <= len_trim(ltext))
                         pos = pos + 1
                 end do
 
@@ -702,5 +532,13 @@ contains
         end do
 
         end function to_lower
+
+        function time_ms() result(t_ms)
+                real(kind=wp) :: t_ms
+                integer(4) :: ms
+                !call cpu_time(t_ms)
+                call system_clock(ms)
+                t_ms = real(ms)
+        end function
 
 end program
